@@ -1,0 +1,75 @@
+name: Deploy to BuildBear Sandbox
+ 
+on: [push]
+ 
+jobs:
+  test:
+    runs-on: ubuntu-latest
+ 
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+ 
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+ 
+      # Cache Foundry repository
+      - name: Cache Foundry repository
+        uses: actions/cache@v3
+        with:
+          path: foundry
+          key: ${{ runner.os }}-foundry-${{ hashFiles('**/foundry/.gitmodules') }}
+          restore-keys: |
+            ${{ runner.os }}-foundry-
+ 
+      # Cache build artifacts
+      - name: Cache build artifacts
+        uses: actions/cache@v3
+        with:
+          path: $HOME/.config/.foundry/bin
+          key: ${{ runner.os }}-forge-${{ hashFiles('foundry/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-forge-
+            
+      - name: Clone Foundry repository
+        run: |
+          if [ ! -d "foundry" ]; then
+            git clone https://github.com/BuildBearLabs/foundry.git
+          fi
+        shell: bash
+ 
+      - name: Build Foundry from source
+        run: |
+          cd foundry
+          cargo build
+          mkdir -p $HOME/.config/.foundry/bin
+          cp target/debug/forge $HOME/.config/.foundry/bin/
+          echo "PATH=$HOME/.config/.foundry/bin:$PATH" >> $GITHUB_ENV
+        shell: bash
+ 
+      - name: Show Forge version
+        run: forge --version
+ 
+      - name: Run Forge Tests # Optional
+        run: forge test -vvv
+ 
+      - name: Run BB Action CI
+        uses: BuildBearLabs/buildbear_x_action@v1.7.0
+        with:
+          network: |
+            [
+              {
+                "chainId": 1,
+                "blockNumber": 12000000 # Optional
+              },
+              {
+                "chainId": 10
+              }
+            ]
+          deploy-command: "make deploy"
+          buildbear-api-key: "${{ secrets.BUILDBEAR_TOKEN }}"
