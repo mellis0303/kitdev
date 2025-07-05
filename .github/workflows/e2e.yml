@@ -1,0 +1,254 @@
+name: Devkit E2E Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["**"]
+
+env:
+  FOUNDRY_PROFILE: ci
+  L1_FORK_URL: ${{ secrets.HOLESKY_FORK_URL }}
+  L2_FORK_URL: ${{ secrets.HOLESKY_FORK_URL }}
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install devkit CLI
+        run: make install
+
+      - name: Add ~/bin to PATH
+        run: echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Run devkit avs create
+        run: devkit avs create my-awesome-avs
+
+      - name: Verify AVS project created
+        run: |
+          if [ ! -f "./my-awesome-avs/config/config.yaml" ]; then
+            echo "❌ AVS project config/config.yaml not found!"
+            exit 1
+          fi
+          echo "✅ AVS project created successfully at ${GITHUB_WORKSPACE}/my-awesome-avs/"
+
+      - name: Run devkit avs build
+        env:
+            DOCKER_BUILDKIT: 1
+        run: |
+          cd ./my-awesome-avs/
+          devkit avs build
+
+      - name: Start devnet
+        run: |
+          cd ./my-awesome-avs/
+          devkit avs devnet start &
+          # wait until executor and aggregator are available
+          until nc -z localhost 9090 && nc -z localhost 8081; do
+            sleep 1
+          done
+
+      - name: Check devnet RPC is live
+        run: |
+          for i in {1..10}; do
+            bn=$(cast block-number --rpc-url http://localhost:8545 || echo "error")
+            if [ "$bn" != "error" ]; then
+              echo "Current block number: $bn"
+              exit 0
+            fi
+            echo "Waiting for devnet... retrying in 2s"
+            sleep 2
+          done
+          echo "❌ Devnet failed to start"
+          exit 1
+
+      - name: Call AVS
+        run: |
+          cd ./my-awesome-avs/
+          devkit avs call -- signature="(uint256,string)" args='(5,"hello")'
+
+      - name: Verify stake table roots
+        run: |
+          cd ./my-awesome-avs/
+          devkit avs transport verify
+
+      - name: Start local Docker registry
+        run: |
+          docker run -d --name registry -p 5001:5000 registry:2
+          echo "Waiting for registry to be ready..."
+          for i in {1..10}; do
+            if nc -z localhost 5001; then
+              echo "✅ Registry is ready"
+              break
+            fi
+            echo "Waiting for registry... ($i/10)"
+            sleep 2
+          done
+
+      - name: Build and push AVS image to local registry
+        run: |
+          cd ./my-awesome-avs/
+          # Build the AVS image
+          docker build -t localhost:5001/my-awesome-avs:latest .
+          # Push to local registry
+          docker push localhost:5001/my-awesome-avs:latest
+          echo "✅ AVS image pushed to local registry"
+
+      - name: Update config for local registry
+        run: |
+          cd ./my-awesome-avs/
+          # Update the artifact registry in context to use local registry
+          yq eval '.context.artifact.registry = "localhost:5001"' -i config/contexts/devnet.yaml
+          echo "Updated registry configuration:"
+          yq eval '.context.artifact' config/contexts/devnet.yaml
+
+      - name: Publish AVS release
+        run: |
+          cd ./my-awesome-avs/
+          # Get current timestamp + 1 hour for upgrade-by-time
+          UPGRADE_BY_TIME=$(($(date +%s) + 3600))
+          echo "Publishing release with upgrade-by-time: $UPGRADE_BY_TIME ($(date -d @$UPGRADE_BY_TIME))"
+          
+          # Run the release publish command
+          devkit avs release publish --upgrade-by-time $UPGRADE_BY_TIME --registry localhost:5001
+          
+          # Check if the command succeeded
+          if [ $? -eq 0 ]; then
+            echo "✅ Release published successfully"
+          else
+            echo "❌ Release publish failed"
+            exit 1
+          fi
+
+      - name: Verify release on ReleaseManager contract
+        run: |
+          cd ./my-awesome-avs/
+          
+          # Get AVS address from context
+          AVS_ADDRESS=$(yq eval '.context.avs.address' config/contexts/devnet.yaml)
+          echo "AVS Address: $AVS_ADDRESS"
+          
+          # Use the correct ReleaseManager address from devnet constants
+          RELEASE_MANAGER_ADDRESS="0x323A9FcB2De80d04B5C4B0F72ee7799100D32F0F"
+          echo "ReleaseManager Address: $RELEASE_MANAGER_ADDRESS"
+          
+          # Check if ReleaseManager is deployed
+          CODE=$(cast code $RELEASE_MANAGER_ADDRESS --rpc-url http://localhost:8545)
+          if [ "$CODE" = "0x" ]; then
+            echo "❌ ReleaseManager not deployed in local devnet"
+            echo "Cannot verify contract state as required"
+            exit 1
+          fi
+          
+          # Query the ReleaseManager contract to verify the release
+          echo "Querying ReleaseManager for operator set 0..."
+          
+          # Get the latest version
+          LATEST_VERSION=$(cast call $RELEASE_MANAGER_ADDRESS \
+            "latestVersion(address,uint32)" \
+            $AVS_ADDRESS 0 \
+            --rpc-url http://localhost:8545)
+          
+          echo "Latest version for operator set 0: $LATEST_VERSION"
+          
+          # Convert hex to decimal
+          VERSION_DEC=$((LATEST_VERSION))
+          echo "Latest version (decimal): $VERSION_DEC"
+          
+          if [ $VERSION_DEC -eq 0 ]; then
+            echo "❌ No release found on ReleaseManager"
+            exit 1
+          fi
+          
+          # Get release details
+          RELEASE_DATA=$(cast call $RELEASE_MANAGER_ADDRESS \
+            "getRelease(address,uint32,uint256)" \
+            $AVS_ADDRESS 0 $((VERSION_DEC - 1)) \
+            --rpc-url http://localhost:8545)
+          
+          echo "Release data retrieved: $RELEASE_DATA"
+          
+          # Check if release data is not empty
+          if [ -z "$RELEASE_DATA" ] || [ "$RELEASE_DATA" = "0x" ]; then
+            echo "❌ Release data is empty"
+            exit 1
+          fi
+          
+          echo "✅ Release verified on ReleaseManager contract"
+
+      - name: Test multiple operator sets release
+        run: |
+          cd ./my-awesome-avs/
+          
+          # Skip this test if ReleaseManager is not deployed
+          RELEASE_MANAGER_ADDRESS="0x323A9FcB2De80d04B5C4B0F72ee7799100D32F0F"
+          CODE=$(cast code $RELEASE_MANAGER_ADDRESS --rpc-url http://localhost:8545)
+          if [ "$CODE" = "0x" ]; then
+            echo "⚠️  Skipping multiple operator sets test - ReleaseManager not deployed"
+            exit 0
+          fi
+          
+          # Create another operator set
+          echo "Creating operator set 1..."
+          DEPLOYER_KEY=$(yq eval '.context.deployer_private_key' config/contexts/devnet.yaml)
+          AVS_ADDRESS=$(yq eval '.context.avs.address' config/contexts/devnet.yaml)
+          ALLOCATION_MANAGER_ADDRESS="0x76f67c84eF6F6cF76ec52b4cEFa28ca7492Bd43a"
+          
+          # Use cast to create operator set
+          cast send $ALLOCATION_MANAGER_ADDRESS \
+            "createOperatorSets(address,(uint32,address[])[])" \
+            $AVS_ADDRESS "[(1,[])]" \
+            --private-key $DEPLOYER_KEY \
+            --rpc-url http://localhost:8545
+          
+          echo "✅ Operator set 1 created"
+          
+          # Publish release for multiple operator sets
+          UPGRADE_BY_TIME=$(($(date +%s) + 7200))  # 2 hours from now
+          
+          # The release script should handle multiple operator sets
+          devkit avs release publish --upgrade-by-time $UPGRADE_BY_TIME --registry localhost:5001
+          
+          # Verify both operator sets have releases
+          for OPSET in 0 1; do
+            LATEST_VERSION=$(cast call $RELEASE_MANAGER_ADDRESS \
+              "latestVersion(address,uint32)" \
+              $AVS_ADDRESS $OPSET \
+              --rpc-url http://localhost:8545)
+            
+            VERSION_DEC=$((LATEST_VERSION))
+            echo "Operator set $OPSET latest version: $VERSION_DEC"
+            
+            if [ $VERSION_DEC -eq 0 ]; then
+              echo "❌ No release found for operator set $OPSET"
+              exit 1
+            fi
+          done
+          
+          echo "✅ Releases published for multiple operator sets"
+
+      - name: Stop local Docker registry
+        if: always()
+        run: |
+          docker stop registry || true
+          docker rm registry || true
+
+      - name: Stop devnet
+        run: |
+          cd ./my-awesome-avs/
+          devkit avs devnet stop
